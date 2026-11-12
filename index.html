@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>VPAY - Voice Payment Manager</title>
+<style>
+  body { font-family: Arial, sans-serif; max-width: 520px; margin: 30px auto; padding: 0 16px; background: #f4f6fb; color: #1b1f3b; }
+  h1 { text-align: center; margin-bottom: 4px; }
+  .sub { text-align: center; margin-top: 0; }
+  .card { background: #fff; border-radius: 12px; padding: 18px; margin: 16px 0; box-shadow: 0 2px 8px rgba(0,0,0,.08); }
+  button.mic { width: 100%; padding: 16px; font-size: 18px; border: none; border-radius: 10px; background: #1a5cff; color: #fff; cursor: pointer; }
+  button.mic.listening { background: #d62839; }
+  input[type=text] { width: 100%; padding: 10px; font-size: 16px; box-sizing: border-box; margin-top: 10px; }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .row button { flex: 1; padding: 10px; font-size: 16px; border: none; border-radius: 8px; cursor: pointer; }
+  .no { background: #ddd; }
+  .hidden { display: none; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { padding: 6px; border-bottom: 1px solid #eee; text-align: left; font-size: 14px; }
+  #msg { margin-top: 8px; font-weight: bold; }
+  .note { font-size: 12px; color: #666; }
+</style>
+</head>
+<body>
+<h1>VPAY</h1>
+<p class="sub">Bolo: "Rahul ko 5 dollar bhejo khane ke liye"<br />ya "Amit ko 500 rupaye bhejo chai ke liye"</p>
+
+<div class="card">
+  <button id="micBtn" class="mic">🎤 Bolne ke liye dabayein</button>
+  <input type="text" id="textInput" placeholder="Ya yahan type karein aur Enter dabayein" />
+  <div id="msg"></div>
+</div>
+
+<div class="card hidden" id="confirmCard">
+  <h3 id="confirmText"></h3>
+  <p class="note" id="convNote"></p>
+  <div id="paypal-button"></div>
+  <div class="row"><button class="no" id="cancelBtn">Cancel</button></div>
+</div>
+
+<div class="card hidden" id="answerCard">
+  <h3>AI Jawab</h3>
+  <p id="answerText"></p>
+</div>
+
+<div class="card">
+  <h3>Kharche (Expenses)</h3>
+  <table>
+    <thead><tr><th>Kise</th><th>Amount</th><th>Category</th></tr></thead>
+    <tbody id="expBody"></tbody>
+  </table>
+  <p id="total"></p>
+</div>
+
+<script>
+let pending = null;
+let INR_PER_USD = 85;
+let paypalReady = false;
+const msg = document.getElementById("msg");
+
+function speak(text) {
+  try {
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = "en-IN";
+    speechSynthesis.cancel();
+    speechSynthesis.speak(u);
+  } catch (e) {}
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return r.json();
+}
+
+async function loadExpenses() {
+  const r = await fetch("/api/expenses");
+  const d = await r.json();
+  document.getElementById("expBody").innerHTML = d.expenses
+    .map(e => {
+      const sym = e.originalCurrency === "INR" ? "₹" : "$";
+      return `<tr><td>${esc(e.to)}</td><td>${sym}${e.originalAmount}</td><td>${esc(e.category)}</td></tr>`;
+    })
+    .join("");
+  const t = d.expenses.reduce((s, e) => s + e.amountUsd, 0);
+  document.getElementById("total").textContent = "Total: $" + t.toFixed(2);
+}
+
+async function handleText(text) {
+  if (!text) return;
+  msg.textContent = "Samajh raha hoon...";
+  document.getElementById("confirmCard").classList.add("hidden");
+  document.getElementById("answerCard").classList.add("hidden");
+
+  const d = await post("/api/parse", { text });
+  if (!d.ok) { msg.textContent = "Error: " + d.error; return; }
+  const p = d.parsed;
+
+  if (p.action === "send" && p.to && p.amount) {
+    const inr = p.currency === "INR";
+    p.amountUsd = inr ? +(p.amount / INR_PER_USD).toFixed(2) : Number(p.amount);
+    if (p.amountUsd < 0.01) { msg.textContent = "Amount bahut kam hai."; return; }
+    p.category = p.category || "other";
+    pending = p;
+    msg.textContent = "";
+    const label = inr ? `₹${p.amount} (~$${p.amountUsd})` : `$${p.amount}`;
+    const q = `${p.to} ko ${label} bhejun? (${p.category})`;
+    document.getElementById("confirmText").textContent = q;
+    document.getElementById("convNote").textContent = inr
+      ? `Sandbox mein payment USD mein hogi (1 USD = ${INR_PER_USD} INR demo rate).`
+      : "";
+    document.getElementById("confirmCard").classList.remove("hidden");
+    speak(q);
+    renderPayPal();
+  } else if (p.action === "query") {
+    msg.textContent = "";
+    const d2 = await post("/api/ask", { question: p.query || text });
+    document.getElementById("answerText").textContent = d2.answer || d2.error;
+    document.getElementById("answerCard").classList.remove("hidden");
+    speak(d2.answer || "");
+  } else {
+       msg.textContent = 'Samajh nahi aaya. Suna: "' + text + '"';
+  }
+}
+
+function renderPayPal() {
+  const box = document.getElementById("paypal-button");
+  box.innerHTML = "";
+  if (!paypalReady || typeof paypal === "undefined") {
+    box.textContent = "PayPal load ho raha hai, thodi der baad dobara try karein.";
+    return;
+  }
+  paypal.Buttons({
+    createOrder: async () => {
+      const d = await post("/api/create-order", {
+        amountUsd: pending.amountUsd,
+        to: pending.to,
+        category: pending.category,
+      });
+      if (!d.ok) throw new Error(d.error);
+      return d.orderId;
+    },
+    onApprove: async (data) => {
+      const d = await post("/api/capture-order", {
+        orderId: data.orderID,
+        to: pending.to,
+        amountUsd: pending.amountUsd,
+        originalAmount: pending.amount,
+        originalCurrency: pending.currency || "USD",
+        category: pending.category,
+      });
+      msg.textContent = d.ok ? "Payment ho gaya ✅" : "Error: " + d.error;
+      document.getElementById("confirmCard").classList.add("hidden");
+      if (d.ok) speak("Payment successful");
+      loadExpenses();       
+    },
+    onError: (err) => { msg.textContent = "PayPal error: " + err; },
+  }).render("#paypal-button");
+}
+
+document.getElementById("cancelBtn").onclick = () => {
+  document.getElementById("confirmCard").classList.add("hidden");
+  pending = null;
+};
+
+document.getElementById("textInput").addEventListener("keydown", e => {
+  if (e.key === "Enter") { handleText(e.target.value.trim()); e.target.value = ""; }
+});
+
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const micBtn = document.getElementById("micBtn");
+if (SR) {
+  const rec = new SR();
+  rec.lang = "en-IN";
+  rec.interimResults = false;
+  rec.onstart = () => { msg.textContent = ""; micBtn.classList.add("listening"); micBtn.textContent = "🎙️ Sun raha hoon..."; };
+  rec.onend = () => { micBtn.classList.remove("listening"); micBtn.textContent = "🎤 Bolne ke liye dabayein"; };
+  rec.onerror = e => { msg.textContent = "Mic error: " + e.error; };
+  rec.onresult = e => {
+    const t = e.results[0][0].transcript;
+    msg.textContent = "Suna: " + t;
+    handleText(t);
+  };
+  micBtn.onclick = () => { try { rec.start(); } catch (e) {} };
+} else {
+  micBtn.textContent = "Mic is browser mein support nahi (Chrome use karein)";
+}
+
+fetch("/api/config")
+  .then(r => r.json())
+  .then(c => {
+    INR_PER_USD = c.inrPerUsd || 85;
+    const s = document.createElement("script");
+    s.src = `https://www.paypal.com/sdk/js?client-id=${c.clientId}&currency=USD`;
+    s.onload = () => { paypalReady = true; };
+    document.head.appendChild(s);
+  });
+
+loadExpenses();
+</script>
+</body>
+</html>
